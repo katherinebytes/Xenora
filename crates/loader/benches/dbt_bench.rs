@@ -194,10 +194,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn single_sample_has_no_spread() {
+        use super::{Duration, percentile};
+
         let samples = [Duration::from_micros(50)];
         for fraction in [0.25, 0.50, 0.75, 0.95, 0.99] {
             assert_eq!(percentile(&samples, fraction), samples[0]);
@@ -206,6 +206,8 @@ mod tests {
 
     #[test]
     fn percentiles_interpolate_across_even_samples() {
+        use super::{Duration, percentile};
+
         let samples = [10, 20, 30, 100].map(Duration::from_micros);
         assert_eq!(percentile(&samples, 0.50), Duration::from_micros(25));
         assert_eq!(percentile(&samples, 0.95), Duration::from_nanos(89_500));
@@ -218,6 +220,8 @@ mod tests {
 
     #[test]
     fn median_uses_the_middle_of_odd_samples() {
+        use super::{Duration, percentile};
+
         let samples = [10, 20, 100].map(Duration::from_micros);
         assert_eq!(percentile(&samples, 0.50), Duration::from_micros(20));
     }

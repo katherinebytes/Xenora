@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 2
+          fetch-depth: 0
           persist-credentials: false
       - name: Verify native host and install Rust
         run: |
@@ -27,7 +27,7 @@ jobs:
           rustc -vV
       - name: Run upstream benchmark baseline
         run: |
-          git worktree add --detach "$RUNNER_TEMP/baseline" HEAD^
+          git worktree add --detach "$RUNNER_TEMP/baseline" 0fdb9958922237a8d6ca816f04c08aefa4b86f7b
           cd "$RUNNER_TEMP/baseline"
           cargo bench --locked -p xenora-loader --bench dbt_bench
       - name: Check formatting and lint
@@ -36,8 +36,8 @@ jobs:
           cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Check fixed timing samples
         run: |
-          cargo rustc --locked -p xenora-loader --bench dbt_bench -- --test
-          test_binary="$(find target/aarch64-apple-darwin/debug/deps -maxdepth 1 -type f -perm -100 -name 'dbt_bench-*')"
+          cargo rustc --locked -p xenora-loader --bench dbt_bench --message-format=json -- --test > bench-build.jsonl
+          test_binary="$(python3 -c 'import json, sys; print(next(o["executable"] for o in map(json.loads, sys.stdin) if o.get("target", {}).get("name") == "dbt_bench" and o.get("executable")))' < bench-build.jsonl)"
           test -x "$test_binary"
           "$test_binary"
       - name: Check sample counts and cold and warm DBT
@@ -56,5 +56,5 @@ jobs:
           grep -F '0 warmup rounds excluded' single.log
           grep -F '3 warmup rounds excluded' four.log
           test "$(grep -c 'IQR 0ns' single.log)" -eq 3
-      - name: Run loader tests
-        run: cargo test --locked -p xenora-loader
+      - name: Run workspace tests
+        run: cargo test --locked --workspace
