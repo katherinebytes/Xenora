@@ -1,0 +1,75 @@
+name: Reproduce upstream CI on the fork
+
+on:
+  push:
+    branches: [codex/test-dbt-benchmark-percentiles]
+
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-rust:
+    name: ARM64 CPU and build checks
+    runs-on: macos-26
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: 3
+      PYTHONDONTWRITEBYTECODE: 1
+      CARGO_BUILD_TARGET: aarch64-apple-darwin
+      RUSTUP_TOOLCHAIN: 1.100.0-aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify runner architecture
+        run: |
+          uname -m
+          test "$(uname -m)" = arm64
+          test "$(sysctl -n sysctl.proc_translated)" = 0
+      - name: Install native Rust
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustc -vV
+      - name: Check generated status and PE fixtures
+        run: |
+          python3 crates/isa/generate_rdna2_meta.py --check
+          python3 crates/isa/generate_semantics.py --check
+          python3 scripts/audit/semantic_coverage.py --check
+          python3 scripts/audit/status.py --check
+          for fixture in x2 x3 x4; do
+            python3 "experiments/x1/fixtures/$fixture.py" --check || exit 1
+          done
+      - name: Test agent task queue
+        run: |
+          PYTHONPATH=scripts python3 -m unittest discover -s tests/agent_queue
+          sh -n scripts/agent-queue.sh scripts/agent-sync.sh
+      - name: Test pull request template check
+        run: PYTHONPATH=scripts python3 -m unittest discover -s tests/pr_template
+      - name: Test semantic registry generator and coverage report
+        run: |
+          python3 -m unittest discover -s tests/semantics_generator
+          PYTHONPATH=scripts python3 -m unittest discover -s tests/semantic_coverage
+      - name: Check formatting and lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo fmt --manifest-path experiments/x1/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path experiments/x1/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Run CPU tests and dependency checks
+        run: |
+          cargo test --locked --workspace
+          cargo test --locked --manifest-path experiments/x1/Cargo.toml
+          scripts/audit/dependencies.sh
+          scripts/audit/claims.sh
+      - name: Inspect native CLI
+        run: |
+          cargo build --locked -p xenora
+          binary=target/aarch64-apple-darwin/debug/xenora
+          file "$binary"
+          test "$(lipo -archs "$binary")" = arm64
+          otool -L "$binary"
