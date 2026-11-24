@@ -88,14 +88,25 @@ fn check(result: ExecutionResult) {
     assert_eq!(result.final_state.get(Register::Rax), ADDS as u64);
 }
 
+fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
+    // Interpolate between adjacent values at rank (n - 1) * fraction.
+    let rank = (sorted.len() - 1) as f64 * fraction;
+    let lower = sorted[rank.floor() as usize];
+    let upper = sorted[rank.ceil() as usize];
+    lower + (upper - lower).mul_f64(rank.fract())
+}
+
 fn report(label: &str, samples: &mut [Duration]) {
     samples.sort_unstable();
-    let median = samples[samples.len() / 2];
+    let median = percentile(samples, 0.50);
+    let p95 = percentile(samples, 0.95);
+    let p99 = percentile(samples, 0.99);
+    let iqr = percentile(samples, 0.75) - percentile(samples, 0.25);
     let min = samples[0];
     let max = samples[samples.len() - 1];
     let mips = INSTRUCTIONS as f64 / median.as_secs_f64() / 1_000_000.0;
     println!(
-        "{label}: {} samples, median {median:?}, min {min:?}, max {max:?}, median {mips:.2} MIPS",
+        "{label}: {} samples, median {median:?}, min {min:?}, max {max:?}, p95 {p95:?}, p99 {p99:?}, IQR {iqr:?}, median {mips:.2} MIPS",
         samples.len()
     );
 }
@@ -104,6 +115,8 @@ fn main() {
     let sample_count = std::env::var("XENORA_DBT_BENCH_SAMPLES")
         .map_or(101, |value| value.parse::<usize>().expect("sample count"));
     assert!(sample_count > 0);
+    let warmup_count = std::env::var("XENORA_DBT_BENCH_WARMUP")
+        .map_or(10, |value| value.parse::<usize>().expect("warmup count"));
 
     let mut code = vec![0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0]; // mov rax, 0
     for _ in 0..ADDS {
@@ -124,38 +137,51 @@ fn main() {
     let mut warm = Vec::with_capacity(sample_count);
     let mut cold_metrics = None;
 
-    for _ in 0..sample_count {
+    for record in
+        std::iter::repeat_n(false, warmup_count).chain(std::iter::repeat_n(true, sample_count))
+    {
         let mut interp = Interpreter::new(initial_cpu.clone(), &mut loaded.memory, BUDGET);
         let start = Instant::now();
         let result = black_box(interp.run());
-        interpreter.push(start.elapsed());
+        let interpreter_time = start.elapsed();
         check(result);
 
         let mut dbt = DbtEngine::new(4 * 1024 * 1024).unwrap();
         let mut cpu = initial_cpu.clone();
         let start = Instant::now();
         let result = black_box(dbt.run(&mut cpu, &mut loaded.memory, BUDGET));
-        cold.push(start.elapsed());
+        let cold_time = start.elapsed();
         check(result);
         assert!(dbt.metrics.blocks_compiled > 0);
         assert_eq!(dbt.metrics.cache_hits, 0);
         assert_eq!(dbt.metrics.cache_misses, dbt.metrics.blocks_compiled);
-        cold_metrics = Some(dbt.metrics);
+        let metrics = dbt.metrics;
 
         let mut cpu = initial_cpu.clone();
         let start = Instant::now();
         let result = black_box(dbt.run(&mut cpu, &mut loaded.memory, BUDGET));
-        warm.push(start.elapsed());
+        let warm_time = start.elapsed();
         check(result);
-        assert_eq!(
-            Some(dbt.metrics.blocks_compiled),
-            cold_metrics.map(|m| m.blocks_compiled)
-        );
+        assert_eq!(dbt.metrics.blocks_compiled, metrics.blocks_compiled);
         assert_eq!(dbt.metrics.cache_hits, dbt.metrics.blocks_compiled);
         assert_eq!(dbt.metrics.cache_misses, dbt.metrics.blocks_compiled);
+
+        if record {
+            interpreter.push(interpreter_time);
+            cold.push(cold_time);
+            warm.push(warm_time);
+            cold_metrics = Some(metrics);
+        }
     }
 
     println!("{INSTRUCTIONS} guest instructions per sample, final RAX={ADDS}");
+    println!("{warmup_count} warmup rounds excluded (XENORA_DBT_BENCH_WARMUP, default 10)");
+    println!(
+        "Cold DBT includes translation with a fresh engine; warm DBT reuses that engine's cache."
+    );
+    println!(
+        "Percentiles describe this synthetic workload on this host; tail estimates vary with sample count."
+    );
     report("Interpreter", &mut interpreter);
     report("Cold DBT", &mut cold);
     report("Warm DBT", &mut warm);
@@ -164,4 +190,35 @@ fn main() {
         "Cold DBT compiled {} blocks and emitted {} native bytes in {} dispatches",
         metrics.blocks_compiled, metrics.native_bytes_emitted, metrics.dbt_dispatches
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_sample_has_no_spread() {
+        let samples = [Duration::from_micros(50)];
+        for fraction in [0.25, 0.50, 0.75, 0.95, 0.99] {
+            assert_eq!(percentile(&samples, fraction), samples[0]);
+        }
+    }
+
+    #[test]
+    fn percentiles_interpolate_across_even_samples() {
+        let samples = [10, 20, 30, 100].map(Duration::from_micros);
+        assert_eq!(percentile(&samples, 0.50), Duration::from_micros(25));
+        assert_eq!(percentile(&samples, 0.95), Duration::from_nanos(89_500));
+        assert_eq!(percentile(&samples, 0.99), Duration::from_nanos(97_900));
+        assert_eq!(
+            percentile(&samples, 0.75) - percentile(&samples, 0.25),
+            Duration::from_nanos(30_000)
+        );
+    }
+
+    #[test]
+    fn median_uses_the_middle_of_odd_samples() {
+        let samples = [10, 20, 100].map(Duration::from_micros);
+        assert_eq!(percentile(&samples, 0.50), Duration::from_micros(20));
+    }
 }

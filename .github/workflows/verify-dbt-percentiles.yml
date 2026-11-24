@@ -1,0 +1,60 @@
+name: Verify DBT benchmark percentiles
+on:
+  push:
+    branches: [codex/test-dbt-benchmark-percentiles]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: macos-26
+    timeout-minutes: 16
+    env:
+      CARGO_BUILD_JOBS: 3
+      CARGO_BUILD_TARGET: aarch64-apple-darwin
+      RUSTUP_TOOLCHAIN: 1.100.0-aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify native host and install Rust
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(sysctl -n sysctl.proc_translated)" = 0
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustc -vV
+      - name: Run upstream benchmark baseline
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/baseline" HEAD^
+          cd "$RUNNER_TEMP/baseline"
+          cargo bench --locked -p xenora-loader --bench dbt_bench
+      - name: Check formatting and lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Check fixed timing samples
+        run: |
+          cargo rustc --locked -p xenora-loader --bench dbt_bench -- --test
+          test_binary="$(find target/aarch64-apple-darwin/debug/deps -maxdepth 1 -type f -perm -100 -name 'dbt_bench-*')"
+          test -x "$test_binary"
+          "$test_binary"
+      - name: Check sample counts and cold and warm DBT
+        run: |
+          cargo bench --locked -p xenora-loader --bench dbt_bench | tee default.log
+          XENORA_DBT_BENCH_WARMUP=0 XENORA_DBT_BENCH_SAMPLES=1 cargo bench --locked -p xenora-loader --bench dbt_bench | tee single.log
+          XENORA_DBT_BENCH_WARMUP=3 XENORA_DBT_BENCH_SAMPLES=4 cargo bench --locked -p xenora-loader --bench dbt_bench | tee four.log
+          for pair in default:101 single:1 four:4; do
+            file="${pair%:*}.log"
+            count="${pair#*:}"
+            for label in Interpreter 'Cold DBT' 'Warm DBT'; do
+              grep -E "^$label: $count samples, median .*, min .*, max .*, p95 .*, p99 .*, IQR " "$file"
+            done
+          done
+          grep -F '10 warmup rounds excluded' default.log
+          grep -F '0 warmup rounds excluded' single.log
+          grep -F '3 warmup rounds excluded' four.log
+          test "$(grep -c 'IQR 0ns' single.log)" -eq 3
+      - name: Run loader tests
+        run: cargo test --locked -p xenora-loader
